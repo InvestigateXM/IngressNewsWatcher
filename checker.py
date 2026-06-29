@@ -34,7 +34,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "IngressDiff/1.0 (https://github.com/ingress-diff)"
+SESSION.headers["User-Agent"] = "IngressDiff/1.0 (https://github.com/InvestigateXM/IngressNewsWatcher)"
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +241,8 @@ def notify_new(url: str, title: str, source: str) -> None:
 def notify_edited(url: str, title: str, old_text: str, new_text: str, source: str, key: str) -> None:
     log.info("EDITED [%s]: %s", source, url)
 
-    old_lines = old_text.splitlines(keepends=True)
-    new_lines = new_text.splitlines(keepends=True)
+    old_lines = [l + "\n" for l in old_text.splitlines()]
+    new_lines = [l + "\n" for l in new_text.splitlines()]
     diff_lines = list(difflib.unified_diff(old_lines, new_lines, fromfile="before", tofile="after", n=3))
     diff_text = "".join(diff_lines)
 
