@@ -12,6 +12,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import fcntl
+    _FCNTL_AVAILABLE = True
+except ImportError:
+    _FCNTL_AVAILABLE = False  # Windows — locking skipped
+
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -22,6 +28,7 @@ BASE_URL = "https://ingress.com"
 NEWS_URL = f"{BASE_URL}/news"
 ZENDESK_API_URL = "https://support.ingress.com/api/v2/help_center/en-us/articles?page[size]=100"
 STATE_FILE = Path(__file__).parent / "state.json"
+LOCK_FILE = Path(__file__).parent / ".lock"
 REQUEST_DELAY = 0.3  # seconds between HTTP requests
 FULL_SCAN_INTERVAL = 3600  # seconds (1 hour)
 NON_ARTICLE_SLUGS = {"/news/events"}
@@ -446,4 +453,12 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    if _FCNTL_AVAILABLE:
+        _lock_fh = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.info("Another instance is still running, skipping this run.")
+            _lock_fh.close()
+            sys.exit(0)
     run()
