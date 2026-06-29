@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,8 +30,8 @@ NEWS_URL = f"{BASE_URL}/news"
 ZENDESK_API_URL = "https://support.ingress.com/api/v2/help_center/en-us/articles?page[size]=100"
 STATE_FILE = Path(__file__).parent / "state.json"
 LOCK_FILE = Path(__file__).parent / ".lock"
-REQUEST_DELAY = 0.3  # seconds between HTTP requests
 FULL_SCAN_INTERVAL = 3600  # seconds (1 hour)
+NEWS_FETCH_WORKERS = 10    # concurrent article fetches
 NON_ARTICLE_SLUGS = {"/news/events"}
 
 logging.basicConfig(
@@ -42,6 +43,10 @@ log = logging.getLogger(__name__)
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = "IngressDiff/1.0 (https://github.com/InvestigateXM/IngressNewsWatcher)"
+
+
+class RateLimitError(RuntimeError):
+    """Raised when a server persistently returns 429 after all retries."""
 
 
 # ---------------------------------------------------------------------------
@@ -66,13 +71,20 @@ def save_state(state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch(url: str, method: str = "GET") -> requests.Response | None:
-    try:
-        resp = SESSION.request(method, url, timeout=15)
-        time.sleep(REQUEST_DELAY)
-        return resp
-    except requests.RequestException as exc:
-        log.warning("Request failed for %s: %s", url, exc)
-        return None
+    """Fetch a URL, retrying on 429 with Retry-After backoff.
+    Raises RateLimitError if the server keeps rate limiting after all retries."""
+    for attempt in range(1, 4):
+        try:
+            resp = SESSION.request(method, url, timeout=15)
+        except requests.RequestException as exc:
+            log.warning("Request failed for %s: %s", url, exc)
+            return None
+        if resp.status_code != 429:
+            return resp
+        retry_after = int(resp.headers.get("Retry-After", 5 * attempt))
+        log.warning("Rate limited by server (attempt %d/3), backing off %ds: %s", attempt, retry_after, url)
+        time.sleep(retry_after)
+    raise RateLimitError(f"Persistent rate limiting after 3 attempts: {url}")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +325,10 @@ def check_support_articles(state: dict) -> None:
 
     try:
         articles = fetch_zendesk_articles()
+    except RateLimitError as exc:
+        log.error("Skipping support center check: %s", exc)
+        send_message("⚠️ <b>[Support Center]</b> Rate limited by support.ingress.com. Support check skipped this run.")
+        return
     except RuntimeError as exc:
         log.error("Skipping support center check: %s", exc)
         return
@@ -392,25 +408,30 @@ def seconds_since(iso_ts: str | None) -> float:
         return float("inf")
 
 
-def check_article(slug: str, state: dict) -> str:
-    """Fetch article, compare to stored state, notify if changed, update state.
-    Returns 'new', 'edited', 'unchanged', or 'error'."""
-    resp = fetch(f"{BASE_URL}{slug}")
+def _fetch_article(slug: str) -> tuple[str, str, str]:
+    """Fetch and extract a single article. Runs in worker threads.
+    Returns (title, content_hash, content_text), or raises RateLimitError / returns ("","","") on error."""
+    try:
+        resp = fetch(f"{BASE_URL}{slug}")
+    except RateLimitError:
+        raise
     if not resp:
         log.warning("(News Blog) Skipping %s (fetch failed)", slug)
-        return "error"
+        return "", "", ""
     if resp.status_code != 200:
         log.warning("(News Blog) Skipping %s (HTTP %d)", slug, resp.status_code)
-        return "error"
-
+        return "", "", ""
     title, content_hash, content_text = extract_content(resp.text)
     if not content_hash:
         log.warning("(News Blog) Could not extract content from %s", slug)
-        return "error"
+        return "", "", ""
+    return title, content_hash, content_text
 
-    now = now_iso()
+
+def _process_article(slug: str, title: str, content_hash: str, content_text: str, state: dict, now: str) -> str:
+    """Compare pre-fetched article content against state, notify if changed, update state.
+    Runs in the main thread. Returns 'new', 'edited', or 'unchanged'."""
     stored = state["articles"].get(slug)
-
     if stored is None:
         state["articles"][slug] = {
             "title": title,
@@ -445,6 +466,10 @@ def run() -> None:
 
     try:
         current_slugs, _ = crawl_listing(full_scan)
+    except RateLimitError as exc:
+        log.error("Aborting run: %s", exc)
+        send_message("⚠️ <b>[Ingress News]</b> Rate limited by ingress.com while fetching the news listing. Run aborted.")
+        return
     except RuntimeError as exc:
         log.error("Aborting run: %s", exc)
         return
@@ -466,12 +491,39 @@ def run() -> None:
             else:
                 log.debug("(News Blog) %s missing from listing but still reachable, keeping", slug)
 
-    # Check content for all slugs in the current scan scope
-    log.info("(News Blog) Checking %d articles for changes...", len(current_slugs))
-    news_counts = {"new": 0, "edited": 0, "unchanged": 0, "error": 0}
+    # Fetch all article pages concurrently, then process results in the main thread
+    log.info("(News Blog) Fetching %d articles concurrently (%d workers)...", len(current_slugs), NEWS_FETCH_WORKERS)
+    fetched: dict[str, tuple[str, str, str]] = {}
+    rate_limited_slugs: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=NEWS_FETCH_WORKERS) as executor:
+        future_to_slug = {executor.submit(_fetch_article, slug): slug for slug in current_slugs}
+        for future in as_completed(future_to_slug):
+            slug = future_to_slug[future]
+            try:
+                fetched[slug] = future.result()
+            except RateLimitError:
+                log.error("(News Blog) Rate limited fetching %s", slug)
+                rate_limited_slugs.append(slug)
+
+    if rate_limited_slugs:
+        send_message(
+            f"⚠️ <b>[Ingress News]</b> Rate limited by ingress.com for "
+            f"{len(rate_limited_slugs)} article(s). They will be retried next run."
+        )
+
+    log.info("(News Blog) Checking %d articles for changes...", len(fetched))
+    now = now_iso()
+    news_counts: dict[str, int] = {"new": 0, "edited": 0, "unchanged": 0, "error": len(rate_limited_slugs)}
     for slug in current_slugs:
-        result = check_article(slug, state)
-        news_counts[result] = news_counts.get(result, 0) + 1
+        if slug not in fetched:
+            continue  # was rate limited
+        title, content_hash, content_text = fetched[slug]
+        if not content_hash:
+            news_counts["error"] += 1
+            continue
+        result = _process_article(slug, title, content_hash, content_text, state, now)
+        news_counts[result] += 1
 
     if news_counts["new"] == 0 and news_counts["edited"] == 0:
         log.info("(News Blog) No changes found (%d checked)", news_counts["unchanged"])
