@@ -112,6 +112,7 @@ def crawl_listing(full_scan: bool) -> tuple[list[str], int]:
     Fetch listing pages and return (all_slugs, max_page).
     Quick scan: page 1 only. Full scan: all pages.
     """
+    log.info("(News Blog) Fetching listing page 1...")
     resp = fetch(NEWS_URL)
     if not resp or resp.status_code != 200:
         raise RuntimeError("Failed to fetch main news listing page")
@@ -119,19 +120,21 @@ def crawl_listing(full_scan: bool) -> tuple[list[str], int]:
     html_p1 = resp.text
     max_page = parse_max_page(html_p1)
     slugs = parse_article_slugs(html_p1)
-    log.info("Page 1: %d slugs found (max_page=%d)", len(slugs), max_page)
+    log.info("(News Blog) Page 1: %d articles found (max_page=%d)", len(slugs), max_page)
 
     if full_scan and max_page > 1:
         for page in range(2, max_page + 1):
+            log.info("(News Blog) Fetching listing page %d/%d...", page, max_page)
             resp = fetch(f"{NEWS_URL}?page={page}")
             if not resp or resp.status_code != 200:
-                log.warning("Failed to fetch page %d, skipping", page)
+                log.warning("(News Blog) Failed to fetch page %d, skipping", page)
                 continue
             page_slugs = parse_article_slugs(resp.text)
-            log.info("Page %d: %d slugs found", page, len(page_slugs))
+            log.info("(News Blog) Page %d: %d articles found", page, len(page_slugs))
             for s in page_slugs:
                 if s not in slugs:
                     slugs.append(s)
+        log.info("(News Blog) Full listing crawl complete: %d articles across %d pages", len(slugs), max_page)
 
     return slugs, max_page
 
@@ -275,18 +278,23 @@ def fetch_zendesk_articles() -> list[dict]:
     """Fetch all articles from the Zendesk Help Center API, following cursor pagination."""
     articles = []
     url = ZENDESK_API_URL
+    page = 1
+    log.info("(Support Center) Fetching articles...")
     while url:
         resp = fetch(url)
         if not resp or resp.status_code != 200:
-            raise RuntimeError(f"Failed to fetch Zendesk articles: {url}")
+            raise RuntimeError(f"Failed to fetch Zendesk articles (page {page}): {url}")
         data = resp.json()
-        articles.extend(data.get("articles", []))
+        batch = data.get("articles", [])
+        articles.extend(batch)
+        log.info("(Support Center) Page %d: %d articles fetched (%d total so far)", page, len(batch), len(articles))
         meta = data.get("meta", {})
         if meta.get("has_more") and meta.get("after_cursor"):
             url = f"{ZENDESK_API_URL}&page[after]={meta['after_cursor']}"
+            page += 1
         else:
             url = None
-    log.info("Zendesk: %d articles fetched", len(articles))
+    log.info("(Support Center) Fetching complete: %d articles across %d page(s)", len(articles), page)
     return articles
 
 
@@ -312,14 +320,20 @@ def check_support_articles(state: dict) -> None:
     current_ids = {str(a["id"]) for a in articles}
     known_ids = set(state["support_articles"].keys())
     now = now_iso()
+    counts = {"new": 0, "edited": 0, "removed": 0, "unchanged": 0}
 
     # Deletions: article IDs no longer returned by the API
-    for article_id in list(known_ids - current_ids):
+    removed_ids = known_ids - current_ids
+    if removed_ids:
+        log.info("(Support Center) %d article(s) no longer in API, marking as removed", len(removed_ids))
+    for article_id in list(removed_ids):
         stored = state["support_articles"][article_id]
         notify_deleted(stored["html_url"], stored["title"], "Support Center")
         del state["support_articles"][article_id]
+        counts["removed"] += 1
 
     # New and edited articles
+    log.info("(Support Center) Checking %d articles for changes...", len(articles))
     for article in articles:
         article_id = str(article["id"])
         title = article.get("title") or article.get("name", "")
@@ -337,6 +351,7 @@ def check_support_articles(state: dict) -> None:
                 "last_changed": now,
             }
             notify_new(html_url, title, "Support Center")
+            counts["new"] += 1
         elif stored["content_hash"] != content_hash:
             old_text = stored.get("content_text", "")
             state["support_articles"][article_id].update({
@@ -347,8 +362,16 @@ def check_support_articles(state: dict) -> None:
                 "last_changed": now,
             })
             notify_edited(html_url, title, old_text, content_text, "Support Center", f"support-{article_id}")
+            counts["edited"] += 1
         else:
-            log.debug("No change: support/%s", article_id)
+            log.debug("(Support Center) No change: %s", article_id)
+            counts["unchanged"] += 1
+
+    if counts["new"] == 0 and counts["edited"] == 0 and counts["removed"] == 0:
+        log.info("(Support Center) No changes found (%d checked)", counts["unchanged"])
+    else:
+        log.info("(Support Center) Done: %d new, %d edited, %d removed, %d unchanged",
+                 counts["new"], counts["edited"], counts["removed"], counts["unchanged"])
 
 
 # ---------------------------------------------------------------------------
@@ -369,26 +392,26 @@ def seconds_since(iso_ts: str | None) -> float:
         return float("inf")
 
 
-def check_article(slug: str, state: dict) -> None:
-    """Fetch article, compare to stored state, notify if changed, update state."""
+def check_article(slug: str, state: dict) -> str:
+    """Fetch article, compare to stored state, notify if changed, update state.
+    Returns 'new', 'edited', 'unchanged', or 'error'."""
     resp = fetch(f"{BASE_URL}{slug}")
     if not resp:
-        log.warning("Skipping %s (fetch failed)", slug)
-        return
+        log.warning("(News Blog) Skipping %s (fetch failed)", slug)
+        return "error"
     if resp.status_code != 200:
-        log.warning("Skipping %s (HTTP %d)", slug, resp.status_code)
-        return
+        log.warning("(News Blog) Skipping %s (HTTP %d)", slug, resp.status_code)
+        return "error"
 
     title, content_hash, content_text = extract_content(resp.text)
     if not content_hash:
-        log.warning("Could not extract content from %s", slug)
-        return
+        log.warning("(News Blog) Could not extract content from %s", slug)
+        return "error"
 
     now = now_iso()
     stored = state["articles"].get(slug)
 
     if stored is None:
-        # Brand new article discovered
         state["articles"][slug] = {
             "title": title,
             "content_hash": content_hash,
@@ -397,8 +420,8 @@ def check_article(slug: str, state: dict) -> None:
             "last_changed": now,
         }
         notify_new(f"{BASE_URL}{slug}", title, "Ingress News")
+        return "new"
     elif stored["content_hash"] != content_hash:
-        # Existing article was edited
         old_text = stored.get("content_text", "")
         state["articles"][slug].update({
             "title": title,
@@ -407,8 +430,10 @@ def check_article(slug: str, state: dict) -> None:
             "last_changed": now,
         })
         notify_edited(f"{BASE_URL}{slug}", title, old_text, content_text, "Ingress News", slug)
+        return "edited"
     else:
-        log.debug("No change: %s", slug)
+        log.debug("(News Blog) No change: %s", slug)
+        return "unchanged"
 
 
 def run() -> None:
@@ -429,18 +454,30 @@ def run() -> None:
 
     # Detect deletions: known articles no longer appearing in any listing page
     if full_scan:
-        for slug in list(known_set - current_set):
+        missing = known_set - current_set
+        if missing:
+            log.info("(News Blog) Checking %d article(s) missing from listing...", len(missing))
+        for slug in list(missing):
             resp = fetch(f"{BASE_URL}{slug}", method="HEAD")
             if resp and resp.status_code == 404:
                 title = state["articles"][slug].get("title", slug)
                 notify_deleted(f"{BASE_URL}{slug}", title, "Ingress News")
                 del state["articles"][slug]
             else:
-                log.debug("Slug %s missing from listing but still reachable, keeping", slug)
+                log.debug("(News Blog) %s missing from listing but still reachable, keeping", slug)
 
     # Check content for all slugs in the current scan scope
+    log.info("(News Blog) Checking %d articles for changes...", len(current_slugs))
+    news_counts = {"new": 0, "edited": 0, "unchanged": 0, "error": 0}
     for slug in current_slugs:
-        check_article(slug, state)
+        result = check_article(slug, state)
+        news_counts[result] = news_counts.get(result, 0) + 1
+
+    if news_counts["new"] == 0 and news_counts["edited"] == 0:
+        log.info("(News Blog) No changes found (%d checked)", news_counts["unchanged"])
+    else:
+        log.info("(News Blog) Done: %d new, %d edited, %d unchanged",
+                 news_counts["new"], news_counts["edited"], news_counts["unchanged"])
 
     # Support center is checked every run (single API call covers all articles)
     check_support_articles(state)
@@ -449,7 +486,7 @@ def run() -> None:
         state["last_full_scan"] = now_iso()
 
     save_state(state)
-    log.info("Done (%s scan, %d news slugs processed)", scan_type, len(current_slugs))
+    log.info("Scan complete (%s)", scan_type)
 
 
 if __name__ == "__main__":
