@@ -176,6 +176,11 @@ def extract_content(html: str) -> tuple[str, str, str]:
     for tag in article.find_all(True):
         tag.attrs.pop("class", None)
 
+    # Replace img tags with a text placeholder so image changes are detected in the hash/diff
+    for img in article.find_all("img"):
+        src = img.get("src", "")
+        img.replace_with(f"\n[Image: {src}]\n" if src else "")
+
     title_tag = article.find("h1", id="news-title")
     title = title_tag.get_text(strip=True) if title_tag else ""
 
