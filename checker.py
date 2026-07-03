@@ -395,20 +395,26 @@ def check_support_articles(state: dict) -> None:
 # App Store monitor
 # ---------------------------------------------------------------------------
 
-def notify_app_update(version: str, release_date: str, notes: str, store_url: str, notes_revised: bool = False) -> None:
+def notify_app_update(version: str, release_date: str, notes: str, store_url: str,
+                      old_notes: str = "", notes_revised: bool = False) -> None:
     formatted_date = release_date[:10]  # YYYY-MM-DD from ISO timestamp
-    if notes_revised:
-        header = f'📱 <b>[Ingress iOS]</b> Release notes revised for <b>v{version}</b> ({formatted_date})\n\n'
-    else:
-        header = f'📱 <b>[Ingress iOS]</b> New update available: <b>v{version}</b> ({formatted_date})\n\n'
+    store_link = f'<a href="{store_url}">View on App Store</a>'
 
-    full_text = header + (notes or "No release notes provided.")
+    if notes_revised:
+        header = f'📱 <b>[Ingress iOS]</b> Release notes revised for <b>v{version}</b> ({formatted_date}) — {store_link}\n\n'
+        body = (notes or "No release notes provided.")
+        body += f"\n\n\n<b>Previous notes:</b>\n{old_notes}" if old_notes else ""
+    else:
+        header = f'📱 <b>[Ingress iOS]</b> New update available: <b>v{version}</b> ({formatted_date}) — {store_link}\n\n'
+        body = (notes or "No release notes provided.")
+
+    full_text = header + body
 
     if len(full_text) <= 4096:
         send_message(full_text)
     else:
         caption = header.strip()
-        send_document(caption, f"changelog-v{version}.txt", (notes or "").encode("utf-8"))
+        send_document(caption, f"changelog-v{version}.txt", body.encode("utf-8"))
 
 
 def check_app_store(state: dict) -> None:
@@ -467,7 +473,8 @@ def check_app_store(state: dict) -> None:
             "release_notes": notes,
             "last_changed": now,
         })
-        notify_app_update(version, release_date, notes, store_url, notes_revised=True)
+        notify_app_update(version, release_date, notes, store_url,
+                          old_notes=stored.get("release_notes", ""), notes_revised=True)
     else:
         log.info("(App Store) No change: Ingress iOS v%s", version)
 
