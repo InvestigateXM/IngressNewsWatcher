@@ -324,7 +324,7 @@ def extract_support_content(body_html: str) -> tuple[str, str]:
     return content_hash, content_text
 
 
-def check_support_articles(state: dict) -> None:
+def check_support_articles(state: dict, baseline_mode: bool = False) -> None:
     """Fetch all Zendesk articles, compare to state, and notify on changes."""
     if "support_articles" not in state:
         state["support_articles"] = {}
@@ -372,7 +372,8 @@ def check_support_articles(state: dict) -> None:
                 "first_seen": now,
                 "last_changed": now,
             }
-            notify_new(html_url, title, "Support Center")
+            if not baseline_mode:
+                notify_new(html_url, title, "Support Center")
             counts["new"] += 1
         elif stored["content_hash"] != content_hash:
             old_text = stored.get("content_text", "")
@@ -422,7 +423,7 @@ def notify_app_update(version: str, release_date: str, notes: str, store_url: st
         send_document(caption, f"changelog-v{version}.txt", body.encode("utf-8"))
 
 
-def check_app_store(state: dict) -> None:
+def check_app_store(state: dict, baseline_mode: bool = False) -> None:
     """Fetch the latest Ingress iOS version from the iTunes Lookup API and notify on updates."""
     if "app_store" not in state:
         state["app_store"] = {}
@@ -460,7 +461,7 @@ def check_app_store(state: dict) -> None:
             "first_seen": now,
             "last_changed": now,
         }
-        log.info("(App Store) Baseline saved: Ingress iOS v%s — no notification on first run", version)
+        log.info("(App Store) Baseline saved: Ingress iOS v%s", version)
     elif stored["version"] != version:
         log.info("(App Store) New version detected: v%s -> v%s", stored["version"], version)
         state["app_store"]["ingress_ios"].update({
@@ -522,7 +523,8 @@ def _fetch_article(slug: str) -> tuple[str, str, str]:
     return title, content_hash, content_text
 
 
-def _process_article(slug: str, title: str, content_hash: str, content_text: str, state: dict, now: str) -> str:
+def _process_article(slug: str, title: str, content_hash: str, content_text: str,
+                     state: dict, now: str, baseline_mode: bool = False) -> str:
     """Compare pre-fetched article content against state, notify if changed, update state.
     Runs in the main thread. Returns 'new', 'edited', or 'unchanged'."""
     stored = state["articles"].get(slug)
@@ -534,7 +536,8 @@ def _process_article(slug: str, title: str, content_hash: str, content_text: str
             "first_seen": now,
             "last_changed": now,
         }
-        notify_new(f"{BASE_URL}{slug}", title, "Ingress News")
+        if not baseline_mode:
+            notify_new(f"{BASE_URL}{slug}", title, "Ingress News")
         return "new"
     elif stored["content_hash"] != content_hash:
         old_text = stored.get("content_text", "")
@@ -552,7 +555,11 @@ def _process_article(slug: str, title: str, content_hash: str, content_text: str
 
 
 def run() -> None:
+    baseline_mode = not STATE_FILE.exists()
     state = load_state()
+
+    if baseline_mode:
+        log.info("No state.json found — baseline run, saving state without sending notifications")
 
     full_scan = seconds_since(state.get("last_full_scan")) >= FULL_SCAN_INTERVAL
     scan_type = "full" if full_scan else "quick"
@@ -616,7 +623,7 @@ def run() -> None:
         if not content_hash:
             news_counts["error"] += 1
             continue
-        result = _process_article(slug, title, content_hash, content_text, state, now)
+        result = _process_article(slug, title, content_hash, content_text, state, now, baseline_mode)
         news_counts[result] += 1
 
     if news_counts["new"] == 0 and news_counts["edited"] == 0:
@@ -626,14 +633,20 @@ def run() -> None:
                  news_counts["new"], news_counts["edited"], news_counts["unchanged"])
 
     # Support center and App Store are checked every run (single lightweight requests each)
-    check_support_articles(state)
-    check_app_store(state)
+    check_support_articles(state, baseline_mode)
+    check_app_store(state, baseline_mode)
 
     if full_scan:
         state["last_full_scan"] = now_iso()
 
     save_state(state)
-    log.info("Scan complete (%s)", scan_type)
+
+    if baseline_mode:
+        log.info("Baseline complete — %d news, %d support articles, App Store version saved. "
+                 "Notifications will fire from the next run onwards.",
+                 len(state["articles"]), len(state["support_articles"]))
+    else:
+        log.info("Scan complete (%s)", scan_type)
 
 
 if __name__ == "__main__":
