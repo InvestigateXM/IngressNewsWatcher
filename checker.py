@@ -28,6 +28,7 @@ load_dotenv()
 BASE_URL = "https://ingress.com"
 NEWS_URL = f"{BASE_URL}/news"
 ZENDESK_API_URL = "https://support.ingress.com/api/v2/help_center/en-us/articles?page[size]=100"
+ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup?id=576505181&country=us"
 STATE_FILE = Path(__file__).parent / "state.json"
 LOCK_FILE = Path(__file__).parent / ".lock"
 FULL_SCAN_INTERVAL = 3600  # seconds (1 hour)
@@ -59,7 +60,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception as exc:
             log.warning("Could not read state file, starting fresh: %s", exc)
-    return {"last_full_scan": None, "articles": {}, "support_articles": {}}
+    return {"last_full_scan": None, "articles": {}, "support_articles": {}, "app_store": {}}
 
 
 def save_state(state: dict) -> None:
@@ -391,6 +392,87 @@ def check_support_articles(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# App Store monitor
+# ---------------------------------------------------------------------------
+
+def notify_app_update(version: str, release_date: str, notes: str, store_url: str, notes_revised: bool = False) -> None:
+    formatted_date = release_date[:10]  # YYYY-MM-DD from ISO timestamp
+    if notes_revised:
+        header = f'📱 <b>[Ingress iOS]</b> Release notes revised for <b>v{version}</b> ({formatted_date})\n\n'
+    else:
+        header = f'📱 <b>[Ingress iOS]</b> New update available: <b>v{version}</b> ({formatted_date})\n\n'
+
+    full_text = header + (notes or "No release notes provided.")
+
+    if len(full_text) <= 4096:
+        send_message(full_text)
+    else:
+        caption = header.strip()
+        send_document(caption, f"changelog-v{version}.txt", (notes or "").encode("utf-8"))
+
+
+def check_app_store(state: dict) -> None:
+    """Fetch the latest Ingress iOS version from the iTunes Lookup API and notify on updates."""
+    if "app_store" not in state:
+        state["app_store"] = {}
+
+    log.info("(App Store) Fetching latest Ingress iOS version...")
+    try:
+        resp = fetch(ITUNES_LOOKUP_URL)
+    except RateLimitError as exc:
+        log.error("(App Store) Rate limited, skipping: %s", exc)
+        return
+    if not resp or resp.status_code != 200:
+        log.warning("(App Store) Failed to fetch iTunes data (HTTP %s)", resp.status_code if resp else "none")
+        return
+
+    try:
+        result = resp.json().get("results", [{}])[0]
+        version = result["version"]
+        notes = result.get("releaseNotes", "")
+        release_date = result.get("currentVersionReleaseDate", "")
+        store_url = result.get("trackViewUrl", "https://apps.apple.com/app/id576505181")
+    except (KeyError, IndexError, ValueError) as exc:
+        log.warning("(App Store) Could not parse iTunes response: %s", exc)
+        return
+
+    notes_hash = hashlib.sha256(notes.encode()).hexdigest()
+    now = now_iso()
+    stored = state["app_store"].get("ingress_ios")
+
+    if stored is None:
+        state["app_store"]["ingress_ios"] = {
+            "version": version,
+            "release_notes_hash": notes_hash,
+            "release_notes": notes,
+            "release_date": release_date,
+            "first_seen": now,
+            "last_changed": now,
+        }
+        log.info("(App Store) Baseline saved: Ingress iOS v%s — no notification on first run", version)
+    elif stored["version"] != version:
+        log.info("(App Store) New version detected: v%s -> v%s", stored["version"], version)
+        state["app_store"]["ingress_ios"].update({
+            "version": version,
+            "release_notes_hash": notes_hash,
+            "release_notes": notes,
+            "release_date": release_date,
+            "last_changed": now,
+        })
+        notify_app_update(version, release_date, notes, store_url)
+    elif stored["release_notes_hash"] != notes_hash:
+        log.info("(App Store) Release notes revised for v%s", version)
+        state["app_store"]["ingress_ios"].update({
+            "release_notes_hash": notes_hash,
+            "release_notes": notes,
+            "last_changed": now,
+        })
+        notify_app_update(version, release_date, notes, store_url, notes_revised=True)
+    else:
+        log.info("(App Store) No change: Ingress iOS v%s", version)
+
+
+# ---------------------------------------------------------------------------
 # Main check loop
 # ---------------------------------------------------------------------------
 
@@ -531,8 +613,9 @@ def run() -> None:
         log.info("(News Blog) Done: %d new, %d edited, %d unchanged",
                  news_counts["new"], news_counts["edited"], news_counts["unchanged"])
 
-    # Support center is checked every run (single API call covers all articles)
+    # Support center and App Store are checked every run (single lightweight requests each)
     check_support_articles(state)
+    check_app_store(state)
 
     if full_scan:
         state["last_full_scan"] = now_iso()
