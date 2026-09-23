@@ -423,6 +423,10 @@ def notify_app_update(version: str, release_date: str, notes: str, store_url: st
         send_document(caption, f"changelog-v{version}.txt", body.encode("utf-8"))
 
 
+def _version_key(v: str) -> tuple:
+    return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
+
+
 def check_app_store(state: dict, baseline_mode: bool = False) -> None:
     """Fetch the latest Ingress iOS version from the iTunes Lookup API and notify on updates."""
     if "app_store" not in state:
@@ -430,7 +434,9 @@ def check_app_store(state: dict, baseline_mode: bool = False) -> None:
 
     log.info("(App Store) Fetching latest Ingress iOS version...")
     try:
-        resp = fetch(ITUNES_LOOKUP_URL)
+        # Apple's CDN caches each exact URL for 24h, and different edges hold different
+        # snapshots. A unique param forces a fresh origin response every time.
+        resp = fetch(f"{ITUNES_LOOKUP_URL}&_={int(time.time())}")
     except RateLimitError as exc:
         log.error("(App Store) Rate limited, skipping: %s", exc)
         return
@@ -462,6 +468,8 @@ def check_app_store(state: dict, baseline_mode: bool = False) -> None:
             "last_changed": now,
         }
         log.info("(App Store) Baseline saved: Ingress iOS v%s", version)
+    elif _version_key(version) < _version_key(stored["version"]):
+        log.warning("(App Store) Ignoring stale response v%s (have v%s)", version, stored["version"])
     elif stored["version"] != version:
         log.info("(App Store) New version detected: v%s -> v%s", stored["version"], version)
         state["app_store"]["ingress_ios"].update({
