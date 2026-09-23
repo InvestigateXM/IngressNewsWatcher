@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ingress news and support center change monitor. Sends Telegram notifications for new, edited, or deleted articles."""
+"""Ingress news, support center, App Store and events calendar change monitor. Sends Telegram notifications on changes."""
 
 import difflib
 import hashlib
@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from html import escape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ BASE_URL = "https://ingress.com"
 NEWS_URL = f"{BASE_URL}/news"
 ZENDESK_API_URL = "https://support.ingress.com/api/v2/help_center/en-us/articles?page[size]=100"
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup?id=576505181&country=us"
+EVENTS_URL = "https://prod-ingress.ingress.com/plfe/events"
 STATE_FILE = Path(__file__).parent / "state.json"
 LOCK_FILE = Path(__file__).parent / ".lock"
 FULL_SCAN_INTERVAL = 3600  # seconds (1 hour)
@@ -494,6 +496,130 @@ def check_app_store(state: dict, baseline_mode: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Events calendar
+# ---------------------------------------------------------------------------
+
+def _text(el) -> str:
+    return " ".join(el.get_text(" ").split()) if el else ""
+
+
+def parse_events(page: bytes) -> dict[str, dict]:
+    """Parse the events page into {event_id: fields}. The ID comes from the calendar icon's alt text,
+    e.g. calendar_icon_event_2026MidAutumnPaid1_1234 -> event_2026MidAutumnPaid1_1234.
+    Status (ACTIVE/UPCOMING) and duration are left out: they change with time, not with edits."""
+    soup = BeautifulSoup(page, "lxml")
+    events = {}
+    for row in soup.select("div.row"):
+        title = _text(row.select_one(".title-content-layout > div"))
+        labels = {_text(l).rstrip(":"): l for l in row.select(".yellow-text.exo-bold-400")}
+        value = lambda k: _text(labels[k].find_next_sibling("div")) if k in labels else ""
+        cal = row.select_one("img.calendarIcon")
+        logo = row.select_one("img.eventLogo")
+        key = cal["alt"].removeprefix("calendar_icon_") if cal and cal.get("alt") else title
+        events[key] = {
+            "Title": title,
+            "Tagline": _text(row.select_one(".teal-small-bold-text-text")),
+            "Description": _text(row.select_one(".teal-small-text")),
+            "Start": value("START"),
+            "End": value("END"),
+            "Location": value("LOCATION"),
+            "Registration": " / ".join(_text(p) for p in row.select(".poc-link")),
+            "Logo": logo.get("src", "") if logo else "",
+        }
+    return events
+
+
+def _event_num(key: str) -> int | None:
+    m = re.search(r"_(\d+)$", key)
+    return int(m.group(1)) if m else None
+
+
+def _event_ended(fields: dict) -> bool:
+    try:
+        end = datetime.fromisoformat(fields["End"].split()[0]).replace(tzinfo=timezone.utc)
+    except (ValueError, IndexError):
+        return False
+    return end < datetime.now(timezone.utc)
+
+
+def notify_event_new(key: str, f: dict, skipped: tuple[int, int] | None) -> None:
+    log.info("NEW [Events]: %s", key)
+    lines = [f'🗓️ <b>[Ingress Events] New event:</b> <a href="{EVENTS_URL}">{escape(f["Title"], quote=False)}</a>']
+    lines += [f"<i>{escape(f['Tagline'], quote=False)}</i>"] if f["Tagline"] else []
+    lines += [escape(f["Description"], quote=False)] if f["Description"] else []
+    lines.append("")
+    lines += [f"<b>{k}:</b> {escape(f[k], quote=False)}" for k in ("Start", "End", "Location")]
+    lines.append(f"<b>ID:</b> <code>{escape(key, quote=False)}</code>")
+    if skipped:
+        a, b = skipped
+        lines.append(f"\n⚠️ Skipped event ID{'s' if b > a else ''} {a}{f'–{b}' if b > a else ''} (not on the calendar yet)")
+    send_message("\n".join(lines))
+
+
+def notify_event_changed(key: str, old: dict, new: dict, changed: list[str]) -> None:
+    log.info("EDITED [Events]: %s (%s)", key, ", ".join(changed))
+    lines = [f'✏️ <b>[Ingress Events] Event updated:</b> <a href="{EVENTS_URL}">{escape(new["Title"], quote=False)}</a>', ""]
+    lines += [f"<b>{k}:</b> {escape(old.get(k, ''), quote=False)} → {escape(new[k], quote=False)}" for k in changed]
+    send_message("\n".join(lines))
+
+
+def check_events(state: dict) -> None:
+    """Fetch the in-game events calendar and notify on new, changed, or early-removed events."""
+    log.info("(Events) Fetching events calendar...")
+    try:
+        resp = fetch(EVENTS_URL)
+    except RateLimitError as exc:
+        log.error("(Events) Rate limited, skipping: %s", exc)
+        return
+    if not resp or resp.status_code != 200:
+        log.warning("(Events) Failed to fetch events (HTTP %s)", resp.status_code if resp else "none")
+        return
+
+    # The page sends no Content-Type, so hand bs4 the raw bytes rather than a guessed decode
+    current = parse_events(resp.content)
+    if not current:
+        log.warning("(Events) No events parsed — page layout may have changed, skipping")
+        return
+
+    # Own baseline (not the global baseline_mode) so existing deployments don't announce every current event
+    if "events" not in state:
+        state["events"] = {"items": current, "max_id": max(filter(None, map(_event_num, current)), default=0)}
+        log.info("(Events) Baseline saved: %d events", len(current))
+        return
+
+    stored = state["events"]["items"]
+    max_id = state["events"]["max_id"]
+
+    # Lowest ID first, so events published together don't flag each other as skipped
+    for key in sorted(current.keys() - stored.keys(), key=lambda k: _event_num(k) or 0):
+        num = _event_num(key)
+        skipped = (max_id + 1, num - 1) if num and max_id and num > max_id + 1 else None
+        max_id = max(max_id, num or 0)
+        notify_event_new(key, current[key], skipped)
+
+    for key in current.keys() & stored.keys():
+        old, new = stored[key], current[key]
+        changed = [k for k in new if old.get(k) != new[k]]
+        if not changed:
+            continue
+        if set(changed) <= {"Start", "End"} and _event_ended(old):
+            log.info("(Events) Recurring event rolled over to next date: %s", key)
+        else:
+            notify_event_changed(key, old, new, changed)
+
+    for key in stored.keys() - current.keys():
+        if _event_ended(stored[key]):
+            log.info("(Events) Event ended and left the calendar: %s", key)
+        else:
+            log.info("DELETED [Events]: %s", key)
+            send_message(f'🗑️ <b>[Ingress Events] Event removed before its end date:</b> '
+                         f'<a href="{EVENTS_URL}">{escape(stored[key]["Title"], quote=False)}</a> '
+                         f'(was scheduled to end {escape(stored[key]["End"], quote=False)})')
+
+    state["events"] = {"items": current, "max_id": max_id}
+
+
+# ---------------------------------------------------------------------------
 # Main check loop
 # ---------------------------------------------------------------------------
 
@@ -640,9 +766,10 @@ def run() -> None:
         log.info("(News Blog) Done: %d new, %d edited, %d unchanged",
                  news_counts["new"], news_counts["edited"], news_counts["unchanged"])
 
-    # Support center and App Store are checked every run (single lightweight requests each)
+    # Support center, App Store and events are checked every run (single lightweight requests each)
     check_support_articles(state, baseline_mode)
     check_app_store(state, baseline_mode)
+    check_events(state)
 
     if full_scan:
         state["last_full_scan"] = now_iso()
