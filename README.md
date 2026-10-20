@@ -6,6 +6,7 @@ A Python script that monitors the [Ingress](https://ingress.com/news) news blog 
 
 - Detects **new**, **edited**, and **deleted** articles on both the Ingress news blog and the Zendesk support center
 - Watches the [in-game events calendar](https://prod-ingress.ingress.com/plfe/events) for new events, edits (e.g. extended end dates) and events pulled before their end date; new-event messages note any skipped internal event IDs
+- Watches the [Ingress merch shop](https://ingressmerch.myshopify.com) (public Shopify `products.json` feed) for new products, price / stock / title / description changes, and removed products
 - Sends a **unified diff** as a `.txt` file attachment when an article is edited, showing exactly what changed with 3 lines of context
 - **Two-tier scan**: checks page 1 of the news blog every run (for fast detection of new posts) and performs a full scan of all pages once per hour
 - Robust against site CSS rebuilds — only fires on actual content changes, not navigation/footer/styling updates
@@ -62,6 +63,9 @@ Source is either `Ingress News` or `Support Center`.
 | New calendar event | 🗓️ `[Ingress Events] New event:` with dates, location, internal ID, and a skipped-ID note if applicable |
 | Changed calendar event | ✏️ `[Ingress Events] Event updated:` with `old → new` per changed field |
 | Event removed before its end date | 🗑️ `[Ingress Events] Event removed before its end date:` |
+| New merch product | 🛍️ `[Ingress Merch] New product:` with price and stock |
+| Changed merch product | ✏️ / 📦 `[Ingress Merch] Product updated:` with `old → new` per changed field (📦 = stock only) |
+| Merch product removed | 🗑️ `[Ingress Merch] Product removed:` |
 
 Recurring events (First Saturday, Second Sunday) moving to their next date and events leaving the calendar after they end are silent.
 

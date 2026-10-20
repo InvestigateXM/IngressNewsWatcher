@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ingress news, support center, App Store and events calendar change monitor. Sends Telegram notifications on changes."""
+"""Ingress news, support center, App Store, events calendar and merch shop change monitor. Sends Telegram notifications on changes."""
 
 import difflib
 import hashlib
@@ -31,6 +31,7 @@ NEWS_URL = f"{BASE_URL}/news"
 ZENDESK_API_URL = "https://support.ingress.com/api/v2/help_center/en-us/articles?page[size]=100"
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup?id=576505181&country=us"
 EVENTS_URL = "https://prod-ingress.ingress.com/plfe/events"
+SHOP_URL = "https://ingressmerch.myshopify.com"
 STATE_FILE = Path(__file__).parent / "state.json"
 LOCK_FILE = Path(__file__).parent / ".lock"
 FULL_SCAN_INTERVAL = 3600  # seconds (1 hour)
@@ -620,6 +621,90 @@ def check_events(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Merch shop
+# ---------------------------------------------------------------------------
+
+def fetch_products() -> list[dict]:
+    """Fetch all published products from the public Shopify products feed."""
+    products = []
+    for page in range(1, 21):
+        resp = fetch(f"{SHOP_URL}/products.json?limit=250&page={page}")
+        if not resp or resp.status_code != 200:
+            raise RuntimeError(f"Failed to fetch shop products (page {page})")
+        batch = resp.json().get("products", [])
+        products += batch
+        if len(batch) < 250:
+            break
+    return products
+
+
+def parse_product(p: dict) -> dict:
+    """Reduce a product to the fields worth alerting on. updated_at and image URLs are left out:
+    they change on every inventory sale / CDN version bump."""
+    prices = sorted({float(v["price"]) for v in p["variants"]})
+    price = f"${prices[0]:.2f}" + (f" – ${prices[-1]:.2f}" if prices[-1] != prices[0] else "")
+    return {
+        "Title": p["title"],
+        "Price": price,
+        "Stock": "In stock" if any(v.get("available") for v in p["variants"]) else "Sold out",
+        "Description": _text(BeautifulSoup(p.get("body_html") or "", "lxml")),
+        "Handle": p["handle"],
+    }
+
+
+def check_shop(state: dict) -> None:
+    """Notify on new products, price/stock/title/description changes, and removed products."""
+    log.info("(Shop) Fetching products...")
+    try:
+        products = fetch_products()
+    except RateLimitError as exc:
+        log.error("(Shop) Rate limited, skipping: %s", exc)
+        return
+    except (RuntimeError, ValueError, KeyError) as exc:
+        log.warning("(Shop) Skipping: %s", exc)
+        return
+    if not products:
+        log.warning("(Shop) Feed returned no products, skipping")
+        return
+
+    current = {str(p["id"]): parse_product(p) for p in products}
+
+    # Own baseline (not the global baseline_mode) so existing deployments don't announce the whole catalogue
+    if "shop" not in state:
+        state["shop"] = current
+        log.info("(Shop) Baseline saved: %d products", len(current))
+        return
+
+    stored = state["shop"]
+
+    def link(f: dict) -> str:
+        return f'<a href="{SHOP_URL}/products/{f["Handle"]}">{escape(f["Title"], quote=False)}</a>'
+
+    for pid in current.keys() - stored.keys():
+        f = current[pid]
+        log.info("NEW [Shop]: %s", f["Title"])
+        send_message(f'🛍️ <b>[Ingress Merch] New product:</b> {link(f)}\n'
+                     f'<b>Price:</b> {f["Price"]} · {f["Stock"]}')
+
+    for pid in current.keys() & stored.keys():
+        old, new = stored[pid], current[pid]
+        changed = [k for k in ("Title", "Price", "Stock", "Description") if old.get(k) != new[k]]
+        if not changed:
+            continue
+        log.info("EDITED [Shop]: %s (%s)", new["Title"], ", ".join(changed))
+        icon = "📦" if changed == ["Stock"] else "✏️"
+        lines = [f'{icon} <b>[Ingress Merch] Product updated:</b> {link(new)}', ""]
+        lines += [f"<b>{k}:</b> {escape(old.get(k, ''), quote=False)} → {escape(new[k], quote=False)}" for k in changed]
+        send_message("\n".join(lines)[:4096])
+
+    for pid in stored.keys() - current.keys():
+        log.info("DELETED [Shop]: %s", stored[pid]["Title"])
+        send_message(f'🗑️ <b>[Ingress Merch] Product removed:</b> {escape(stored[pid]["Title"], quote=False)}')
+
+    state["shop"] = current
+
+
+# ---------------------------------------------------------------------------
 # Main check loop
 # ---------------------------------------------------------------------------
 
@@ -770,6 +855,7 @@ def run() -> None:
     check_support_articles(state, baseline_mode)
     check_app_store(state, baseline_mode)
     check_events(state)
+    check_shop(state)
 
     if full_scan:
         state["last_full_scan"] = now_iso()
